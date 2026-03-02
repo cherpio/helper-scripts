@@ -8,7 +8,7 @@ A bash script that automatically updates all your local Git branches by merging 
 - ✅ Handles stacked branches with intelligent rebasing
 - ✅ Excludes specified branch patterns and GitHub PR labels
 - ✅ **Dry-run mode** to preview changes before applying
-- ✅ **No-push mode** to update locally without pushing to remote
+- ✅ **Push mode** to push changes to remote (opt-in)
 - ✅ **Verbose mode** for detailed debugging output
 - ✅ Comprehensive error handling and conflict detection
 - ✅ Clean separation of merge vs rebase conflicts
@@ -19,7 +19,7 @@ A bash script that automatically updates all your local Git branches by merging 
 ### Basic Usage
 
 ```bash
-# Update all branches (auto-detects default branch from GitHub)
+# Update all branches locally (auto-detects default branch from GitHub)
 ./git_auto_update_local_branches.sh
 
 # Override with a different main branch
@@ -28,28 +28,40 @@ A bash script that automatically updates all your local Git branches by merging 
 
 **Note**: The script automatically detects the default branch using GitHub CLI (`gh`). If you don't have `gh` installed or authenticated, you must specify the branch name as an argument.
 
+**Note**: By default the script does **not** push changes to remote. Use `--push` to enable pushing.
+
 ### Dry-Run Mode
 
 Preview what would happen without making any changes. No local or remote changes will be made.
 
 ```bash
-DRY_RUN=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --dry-run
 ```
 
-### No-Push Mode
+### Push Mode
 
-Update all branches locally but do not push to the remote repository. This is useful when you want to review all changes before pushing.
+Update all branches and push changes to the remote repository.
 
 ```bash
-NO_PUSH=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --push
 ```
 
 ### Verbose Mode
 
-By default, the script silences the output of `git` and `gh` commands to keep the summary clean. Use `VERBOSE` mode to see the detailed output for debugging.
+By default, the script silences the output of `git` and `gh` commands to keep the summary clean. Use `--verbose` to see the detailed output for debugging.
 
 ```bash
-VERBOSE=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --verbose
+```
+
+### Combining Flags
+
+Flags can be combined freely and used alongside a branch name argument:
+
+```bash
+./git_auto_update_local_branches.sh --dry-run --verbose
+./git_auto_update_local_branches.sh --push --verbose main
+./git_auto_update_local_branches.sh develop --dry-run
 ```
 
 ## How It Works
@@ -65,13 +77,21 @@ The script processes all non-stacked branches first:
    - Checks out the branch.
    - Pulls latest changes for the branch.
    - Merges the default branch into the branch.
-   - Pushes changes to the remote.
+   - Pushes changes to the remote (only if `--push` is specified).
 
 ### Phase 2: Stacked Branches
 
-Stacked branches follow the naming convention: `stacked/parent-ticket/branch-name`
+Stacked branches reference a parent branch via a ticket number embedded in the branch name. Two naming conventions are supported:
+
+**Legacy format:** `stacked/parent-ticket/branch-name`
 
 Example: `stacked/br4565/BR-4596-my-feature`
+
+**New suffix format:** `branch-name--stacked-<ticket>`
+
+Example: `APY-1235-my-feature--stacked-apy1234`
+
+The suffix format is preferred when CI extracts ticket numbers from branch names, as the branch itself starts with its own ticket number.
 
 The script handles stacked branches intelligently:
 
@@ -87,34 +107,47 @@ The script handles stacked branches intelligently:
 # Parent branch
 BR-1234-authentication
 
-# Stacked branch built on top
+# Legacy stacked branch
 stacked/br1234/BR-5678-user-profile
+
+# New suffix-style stacked branch
+BR-5678-user-profile--stacked-br1234
 ```
 
-**Important**: The parent ticket reference (`br1234`) is case-insensitive and ignores hyphens/underscores.
+**Important**: The parent ticket reference is case-insensitive and ignores hyphens/underscores. In the suffix format it must be pre-normalized (lowercase, no hyphens) since `--` is used as the separator.
 
 Valid matches:
 
-- `BR-1234-feature` matches `stacked/br1234/...`
-- `br_1234_feature` matches `stacked/BR1234/...`
-- `Br1234Feature` matches `stacked/br-1234/...`
+- `BR-1234-feature` matches `stacked/br1234/...` or `...--stacked-br1234`
+- `br_1234_feature` matches `stacked/BR1234/...` or `...--stacked-br1234`
+- `Br1234Feature` matches `stacked/br-1234/...` or `...--stacked-br1234`
 
 ## Configuration
 
-You can configure the script by editing the variables at the top of the file or by setting environment variables when you run it.
+Edit the variables at the top of the script to configure defaults:
 
 ```bash
-# --- Script Configuration ---
-# Auto-detected from GitHub or override with first argument
-MAIN_BRANCH="${1:-$(detect_default_branch)}"
-EXCLUDED_BRANCHES=("backup/" "temp/" "archive/")
+# Branch patterns to exclude from processing
+EXCLUDED_BRANCHES=("backup/" "temp/" "archive/" "topic/")
+
+# GitHub PR labels that exclude a branch from processing
 EXCLUDED_GH_LABELS=("mergequeue")
 
-# --- Environment Variables ---
-DRY_RUN="${DRY_RUN:-false}"
-NO_PUSH="${NO_PUSH:-false}"
-VERBOSE="${VERBOSE:-false}"
+# Regex patterns that identify a branch as stacked.
+# Remove an entry to disable that pattern.
+STACKED_BRANCH_PATTERNS=(
+    "^stacked/"                   # Legacy: stacked/parent-ticket/branch-name
+    "--stacked-[a-zA-Z0-9]+"     # New:    branch-name--stacked-<ticket>
+)
 ```
+
+### CLI Flags
+
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | Preview changes without modifying anything |
+| `--push` | Push changes to remote after updating (default: off) |
+| `--verbose` | Show full git/gh command output |
 
 ### Excluding Branches
 
@@ -198,7 +231,11 @@ The script includes comprehensive error handling:
 2. Create a stacked branch on top, referencing the parent's ticket number:
 
    ```bash
+   # Legacy format
    git checkout -b stacked/br1234/BR-5678-child-feature
+
+   # New suffix format (preferred when CI reads ticket from branch name)
+   git checkout -b BR-5678-child-feature--stacked-br1234
    ```
 
 ### What Happens During Update
@@ -206,22 +243,22 @@ The script includes comprehensive error handling:
 **Scenario 1**: Parent branch still exists.
 
 ```text
-stacked/br1234/BR-5678 rebased onto BR-1234-parent-feature
+BR-5678-child-feature--stacked-br1234 rebased onto BR-1234-parent-feature
 (Manual force-push required)
 ```
 
 **Scenario 2**: Parent has been merged to main.
 
 ```text
-stacked/br1234/BR-5678 merged with main
-(Automatically pushed)
+BR-5678-child-feature--stacked-br1234 merged with main
+(Push if --push flag was used)
 ```
 
 **Scenario 3**: Parent was deleted/not found.
 
 ```text
-stacked/br1234/BR-5678 merged with main
-(Automatically pushed)
+BR-5678-child-feature--stacked-br1234 merged with main
+(Push if --push flag was used)
 ```
 
 ## Common Issues
@@ -236,8 +273,23 @@ stacked/br1234/BR-5678 merged with main
 # Wrong
 stacked/BR-1234-feature
 
+# Correct (legacy format)
+stacked/br1234/BR-5678-feature
+
+# Correct (suffix format)
+BR-5678-feature--stacked-br1234
+```
+
+### Suffix Format: Ticket Must Be Normalized
+
+In the suffix format (`--stacked-<ticket>`), the ticket must be **pre-normalized**: lowercase with no hyphens or underscores, because `--` is the separator.
+
+```bash
+# Wrong (hyphens in suffix are ambiguous)
+BR-5678-feature--stacked-BR-1234
+
 # Correct
-stacked/br1234/BR-1234-feature
+BR-5678-feature--stacked-br1234
 ```
 
 ### Parent Branch Not Found
@@ -254,7 +306,7 @@ The script detects and aborts conflicting operations. You'll need to:
 
 ## Tips
 
-- Run in **dry-run mode** first to preview changes.
+- Run with **--dry-run** first to preview changes.
 - Ensure your working directory is clean before running.
 - Stacked branches are processed in dependency order automatically.
 - The script is safe to re-run—it skips branches that are already up-to-date.
@@ -262,22 +314,28 @@ The script detects and aborts conflicting operations. You'll need to:
 
 ## Examples
 
-### Update all branches with dry-run
+### Update locally (no push)
 
 ```bash
-DRY_RUN=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh
 ```
 
-### Update locally without pushing
+### Update and push to remote
 
 ```bash
-NO_PUSH=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --push
 ```
 
-### See detailed output for debugging
+### Preview with dry-run
 
 ```bash
-VERBOSE=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --dry-run
+```
+
+### Debug with verbose output
+
+```bash
+./git_auto_update_local_branches.sh --verbose
 ```
 
 ### Update using 'develop' as main branch
@@ -286,10 +344,16 @@ VERBOSE=true ./git_auto_update_local_branches.sh
 ./git_auto_update_local_branches.sh develop
 ```
 
-### Combine dry-run and no-push
+### Dry-run with verbose output
 
 ```bash
-DRY_RUN=true NO_PUSH=true ./git_auto_update_local_branches.sh
+./git_auto_update_local_branches.sh --dry-run --verbose
+```
+
+### Push with verbose output on a specific branch
+
+```bash
+./git_auto_update_local_branches.sh --push --verbose main
 ```
 
 ### Exclude additional patterns
@@ -304,7 +368,7 @@ EXCLUDED_BRANCHES=("backup/" "temp/" "archive/" "experimental/")
 
 ```bash
 # Force-push a rebased stacked branch
-git push --force-with-lease origin stacked/br1234/BR-5678-feature
+git push --force-with-lease origin BR-5678-feature--stacked-br1234
 
 # Resolve conflicts manually for failed branches
 git checkout BR-1234-feature

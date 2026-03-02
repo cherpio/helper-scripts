@@ -36,12 +36,36 @@ detect_default_branch() {
     echo "$default_branch"
 }
 
-MAIN_BRANCH="${1:-$(detect_default_branch)}"  # First argument or auto-detect
 EXCLUDED_BRANCHES=("backup/" "temp/" "archive/" "topic/")  # Add patterns to exclude
 EXCLUDED_GH_LABELS=("mergequeue")  # Add GitHub labels to exclude branches with these labels
-DRY_RUN="${DRY_RUN:-false}"  # Set to true for dry-run mode
-NO_PUSH="${NO_PUSH:-false}"  # Set to true to prevent pushing to remote
-VERBOSE="${VERBOSE:-false}" # Set to true for detailed git/gh output
+
+# Regex patterns for detecting stacked branches.
+# Each entry is a regex matched against the full branch name.
+# Remove an entry to disable that pattern; both are active by default.
+STACKED_BRANCH_PATTERNS=(
+    "^stacked/"                     # E.g. stacked/apy1234/APY-1234-my-feature
+    "--stacked-[a-zA-Z0-9]+"        # E.g. APY-1235-my-feature--stacked-apy1234
+)
+
+# Parse CLI flags and optional positional MAIN_BRANCH argument
+DRY_RUN=false
+PUSH=false
+VERBOSE=false
+MAIN_BRANCH=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --push)    PUSH=true ;;
+        --verbose) VERBOSE=true ;;
+        --*)       echo "Unknown option: $arg"; exit 1 ;;
+        *)         MAIN_BRANCH="$arg" ;;
+    esac
+done
+
+if [ -z "$MAIN_BRANCH" ]; then
+    MAIN_BRANCH=$(detect_default_branch)
+fi
 
 # Git hooks to temporarily deactivate during operations
 HOOKS_TO_DEACTIVATE=("post-checkout" "post-merge" "pre-commit")
@@ -211,22 +235,32 @@ build_ticket_branch_map() {
 }
 
 # Check if a branch is a stacked branch
-# Stacked branches follow the pattern: stacked/parent-ticket/branch-name
+# Matches any pattern defined in STACKED_BRANCH_PATTERNS
 is_stacked_branch() {
     local branch="$1"
-    [[ "$branch" =~ ^stacked/ ]]
+    for pattern in "${STACKED_BRANCH_PATTERNS[@]}"; do
+        if [[ "$branch" =~ $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Extract the parent ticket number from a stacked branch name
-# Example: stacked/br1234/BR-2345-my-feature -> br1234
-# Returns empty string if branch doesn't follow the correct pattern
+# Pattern 1: stacked/br1234/BR-2345-my-feature -> br1234
+# Pattern 2: APY-1235-my-feature--stacked-apy1234 -> apy1234
+# Returns empty string if branch doesn't match any known pattern
 extract_parent_ticket() {
     local branch="$1"
     if [[ "$branch" =~ ^stacked/([^/]+)/(.+)$ ]]; then
         echo "${BASH_REMATCH[1]}"
-    else
-        return 1
+        return 0
     fi
+    if [[ "$branch" =~ --stacked-([a-zA-Z0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
 }
 
 # Normalize a ticket identifier by removing special characters and converting to lowercase
@@ -551,8 +585,8 @@ merge_main_into_branch() {
 
         # Push the changes
         print_status "Pushing $branch..."
-        if [ "$NO_PUSH" = true ]; then
-            print_warning "Skipping push (NO_PUSH mode enabled)"
+        if [ "$PUSH" = false ]; then
+            print_warning "Skipping push (use --push to enable)"
             SUCCESSFUL_BRANCHES+=("$branch")
             return 0
         else
@@ -608,7 +642,9 @@ process_stacked_branch() {
     
     if [ -z "$parent_ticket" ]; then
         print_error "Invalid stacked branch format: $branch"
-        print_error "Expected format: stacked/parent-ticket/branch-name"
+        print_error "Expected formats:"
+        print_error "  stacked/parent-ticket/branch-name"
+        print_error "  branch-name--stacked-<ticket> (e.g. APY-1235-my-feature--stacked-apy1234)"
         FAILED_BRANCHES+=("$branch")
         return 0  # Return 0 to not trigger set -e
     fi
@@ -744,11 +780,7 @@ process_stacked_branch() {
         print_success "Rebase successful for $branch"
         
         print_warning "Branch $branch has been rebased locally but NOT pushed."
-        if [ "$NO_PUSH" = true ]; then
-            print_warning "To push when ready: git push --force-with-lease origin $branch"
-        else
-            print_warning "To push: git push --force-with-lease origin $branch"
-        fi
+        print_warning "To push: git push --force-with-lease origin $branch"
         REBASED_BRANCHES+=("$branch")
         return 0
     else
@@ -835,8 +867,8 @@ if [ "$DRY_RUN" = true ]; then
     print_dry_run "DRY-RUN MODE: No changes will be made"
 fi
 
-if [ "$NO_PUSH" = true ]; then
-    print_warning "NO_PUSH MODE: Changes will be made locally but not pushed to remote"
+if [ "$PUSH" = false ]; then
+    print_warning "Changes will be made locally but NOT pushed to remote. Use --push to enable pushing."
 fi
 
 print_status "Main branch: ${YELLOW}${MAIN_BRANCH}${NC}"
@@ -1133,8 +1165,8 @@ fi
 echo
 if [ "$DRY_RUN" = true ]; then
     print_dry_run "Dry-run completed! No actual changes were made."
-elif [ "$NO_PUSH" = true ]; then
-    print_warning "Operation completed! Changes made locally but not pushed to remote."
+elif [ "$PUSH" = false ]; then
+    print_warning "Operation completed! Changes made locally but not pushed to remote. Use --push to push."
 else
     print_status "Operation completed!"
 fi
