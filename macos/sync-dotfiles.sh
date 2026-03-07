@@ -13,7 +13,7 @@ ICLOUD_DOTFILES="$ICLOUD_SYNC/dotfiles"
 BACKUP_DIR="$HOME/.dotfiles_backup_$(date +%Y%m%d_%H%M%S)"
 
 # Config dotfiles and dotfolders to sync
-FILES=(".zshrc" ".gitconfig" ".gitignore_global" ".hgignore_global" ".zprofile")
+FILES=(".zshrc" ".gitconfig" ".gitignore_global" ".hgignore_global" ".zprofile" ".claude.json")
 DIRECTORIES=(".config" ".gnupg" ".git-workspaces" ".claude" ".copilot")
 
 # Other folder pairs to sync (format: "SOURCE_PATH,DESTINATION_PATH")
