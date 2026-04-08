@@ -41,6 +41,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ====================================
+# CONFIRM --all
+# ====================================
+
+if [ "$DELETE_ALL" = true ]; then
+    echo "${YELLOW}Warning: This will delete ALL backup branches, regardless of age.${NC}"
+    echo -n "Are you sure? [y/N] "
+    read -r CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# ====================================
 # MAIN LOGIC
 # ====================================
 
