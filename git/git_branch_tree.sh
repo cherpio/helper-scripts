@@ -40,31 +40,53 @@ USE_COLOR=true
 FETCH=false
 MAIN_BRANCH=""
 
+# Branch-name patterns to exclude. Matched as prefixes (via shell `case`),
+# so `backup/` matches `backup/anything`. Add more via `--exclude PATTERN`.
+EXCLUDED_BRANCHES=("backup/")
+
 print_help() {
     cat <<'EOF'
 Usage:
-  git_branch_tree.sh [MAIN_BRANCH] [--fetch] [--no-color] [--help]
+  git_branch_tree.sh [MAIN_BRANCH] [--fetch] [--exclude PATTERN]...
+                     [--no-color] [--help]
 
 Prints a tree of local branches showing parent/child relationships derived
 from git merge-base. Annotates nodes whose origin-side history suggests a
 different (non-main) parent than local history does.
 
 Options:
-  MAIN_BRANCH   Override detected default branch (e.g. master, develop).
-  --fetch       Run `git fetch origin` before analysing.
-  --no-color    Disable ANSI colour.
-  --help        Show this help and exit.
+  MAIN_BRANCH        Override detected default branch (e.g. master, develop).
+  --fetch            Run `git fetch origin` before analysing.
+  --exclude PATTERN  Skip branches whose name starts with PATTERN. Repeatable.
+                     Default: backup/
+  --no-color         Disable ANSI colour.
+  --help             Show this help and exit.
 EOF
 }
 
-for arg in "$@"; do
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
     case "$arg" in
         --fetch)    FETCH=true ;;
         --no-color) USE_COLOR=false ;;
+        --exclude)
+            i=$((i + 1))
+            if [ "$i" -ge "${#args[@]}" ]; then
+                echo "--exclude requires an argument" >&2
+                exit 1
+            fi
+            EXCLUDED_BRANCHES+=("${args[$i]}")
+            ;;
+        --exclude=*)
+            EXCLUDED_BRANCHES+=("${arg#--exclude=}")
+            ;;
         -h|--help)  print_help; exit 0 ;;
         --*)        echo "Unknown option: $arg" >&2; exit 1 ;;
         *)          MAIN_BRANCH="$arg" ;;
     esac
+    i=$((i + 1))
 done
 
 if [ "$USE_COLOR" = false ]; then
@@ -124,145 +146,223 @@ fi
 # COLLECT BRANCHES
 # ====================================
 
+# Single for-each-ref pass collects branch names AND their tip SHAs, so we
+# don't need a separate `git rev-parse` call per branch later.
 LOCAL_BRANCHES=()
-while IFS= read -r b; do
-    [ -n "$b" ] && LOCAL_BRANCHES+=("$b")
-done < <(git for-each-ref --format='%(refname:short)' refs/heads)
-
-ORIGIN_BRANCHES=()
-while IFS= read -r b; do
+LOCAL_SHA_MAP=""
+while IFS=' ' read -r b sha; do
     [ -n "$b" ] || continue
-    [ "$b" = "origin/HEAD" ] && continue
-    ORIGIN_BRANCHES+=("$b")
-done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin)
+    skip=false
+    for pat in "${EXCLUDED_BRANCHES[@]}"; do
+        case "$b" in
+            $pat*) skip=true; break ;;
+        esac
+    done
+    [ "$skip" = true ] && continue
+    LOCAL_BRANCHES+=("$b")
+    if [ -z "$LOCAL_SHA_MAP" ]; then
+        LOCAL_SHA_MAP="${b}|${sha}"
+    else
+        LOCAL_SHA_MAP="${LOCAL_SHA_MAP}"$'\n'"${b}|${sha}"
+    fi
+done < <(git for-each-ref --format='%(refname:short) %(objectname)' refs/heads)
 
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 
 # ====================================
 # PARENT DETECTION
 # ====================================
+#
+# Algorithm: walk target's unique commits (main..target) from newest to oldest.
+# At each commit C, ask "which branches contain C?" via a single
+# `git for-each-ref --contains`. The first commit where any eligible candidate
+# appears is the fork-point, and that candidate is the parent. This is
+# O(K) git invocations per target (K = commits since main) rather than the
+# previous O(N+M) per target times ~5 git calls each.
+#
+# Eligibility rules:
+#   - Skip target itself and main.
+#   - Skip descendants of target (branches whose tip contains target's SHA):
+#     those branches branched off target, not vice versa.
+#   - For the origin side, restrict candidates to `origin/<X>` where X is a
+#     local branch name — that's the only case where origin supplies useful
+#     pre-rebase history for a branch the user actually cares about.
 
-# find_parent_among <target-local-branch> <candidate-prefix> <candidates...>
-#   candidate-prefix is "" for local candidates, "origin/" for origin candidates.
-#   Prints the best parent candidate (in the candidate namespace), or empty.
-find_parent_among() {
+# Build a newline-wrapped "set" of local branch names for O(1)-ish membership
+# tests via bash pattern matching.
+LOCAL_NAMES_NL=$'\n'
+for b in "${LOCAL_BRANCHES[@]}"; do
+    LOCAL_NAMES_NL="${LOCAL_NAMES_NL}${b}"$'\n'
+done
+
+# Origin candidates: origin refs whose bare name matches a local branch.
+# We build two parallel structures:
+#   - ORIGIN_CANDIDATES_NL: newline-wrapped set for membership tests.
+#   - ORIGIN_CANDIDATE_REFS: array of full refspecs, passed to
+#     `for-each-ref` so it scans only our candidate refs (critical on repos
+#     with thousands of unrelated origin refs).
+ORIGIN_CANDIDATES_NL=$'\n'
+ORIGIN_CANDIDATE_REFS=()
+while IFS= read -r r; do
+    [ -z "$r" ] && continue
+    name="${r#origin/}"
+    [ "$name" = "HEAD" ] && continue
+    [ "$name" = "$MAIN_BRANCH" ] && continue
+    case "$LOCAL_NAMES_NL" in
+        *$'\n'"$name"$'\n'*)
+            ORIGIN_CANDIDATES_NL="${ORIGIN_CANDIDATES_NL}${r}"$'\n'
+            ORIGIN_CANDIDATE_REFS+=("refs/remotes/${r}")
+            ;;
+    esac
+done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin)
+
+# find_parents <target> <target_sha> -> prints "local_parent|origin_parent".
+# Walks target's unique commits once, asking `for-each-ref --contains` about
+# BOTH local heads and candidate origin refs in a single call per commit.
+# This halves git invocations for branches that would otherwise trigger both
+# a local and an origin walk. Short-circuits on the first non-main local
+# parent (annotation only matters when local = main).
+find_parents() {
     local target="$1"
-    local prefix="$2"
-    shift 2
-    local candidates=("$@")
+    local target_sha="$2"
 
-    local target_sha
-    target_sha=$(git rev-parse --verify "$target" 2>/dev/null) || return 0
+    # Scope passed to `git for-each-ref --contains`: all local heads plus
+    # the curated origin candidate refs.
+    local scope=("refs/heads")
+    if [ "${#ORIGIN_CANDIDATE_REFS[@]}" -gt 0 ]; then
+        scope+=("${ORIGIN_CANDIDATE_REFS[@]}")
+    fi
 
-    local fork_main
-    fork_main=$(git merge-base "$MAIN_BRANCH" "$target" 2>/dev/null || true)
+    # Refs whose tip contains target_sha → descendants of target → never parents.
+    local desc_nl=$'\n'
+    local r
+    while IFS= read -r r; do
+        [ -n "$r" ] && desc_nl="${desc_nl}${r}"$'\n'
+    done < <(git for-each-ref --format='%(refname:short)' --contains "$target_sha" "${scope[@]}")
 
-    local self_ns="${prefix}${target}"
-    local main_ns="${prefix}${MAIN_BRANCH}"
+    local local_parent="" origin_parent=""
+    local c cand local_best origin_best
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        local_best=""
+        origin_best=""
+        while IFS= read -r cand; do
+            [ -z "$cand" ] && continue
+            case "$desc_nl" in
+                *$'\n'"$cand"$'\n'*) continue ;;
+            esac
+            case "$cand" in
+                origin/*)
+                    [ -n "$origin_parent" ] && continue
+                    [ "$cand" = "origin/$target" ] && continue
+                    if [ -z "$origin_best" ] || [[ "$cand" < "$origin_best" ]]; then
+                        origin_best="$cand"
+                    fi
+                    ;;
+                *)
+                    [ -n "$local_parent" ] && continue
+                    [ "$cand" = "$target" ] && continue
+                    [ "$cand" = "$MAIN_BRANCH" ] && continue
+                    if [ -z "$local_best" ] || [[ "$cand" < "$local_best" ]]; then
+                        local_best="$cand"
+                    fi
+                    ;;
+            esac
+        done < <(git for-each-ref --format='%(refname:short)' --contains "$c" "${scope[@]}")
 
-    local best=""
-    local best_mb=""
-    local p p_sha mb
+        [ -z "$local_parent" ] && [ -n "$local_best" ] && local_parent="$local_best"
+        [ -z "$origin_parent" ] && [ -n "$origin_best" ] && origin_parent="${origin_best#origin/}"
 
-    for p in "${candidates[@]}"; do
-        [ "$p" = "$self_ns" ] && continue
-        [ "$p" = "$main_ns" ] && continue
-
-        p_sha=$(git rev-parse --verify "$p" 2>/dev/null) || continue
-        [ "$p_sha" = "$target_sha" ] && continue
-
-        # If target is an ancestor of p, then p is a descendant of target
-        # (p branched off target, not the other way around). Skip.
-        if git merge-base --is-ancestor "$target" "$p" 2>/dev/null; then
-            continue
+        # If local found a non-main parent, we're done — annotation only
+        # applies when local collapses to main, so origin no longer matters.
+        if [ -n "$local_parent" ] && [ "$local_parent" != "$MAIN_BRANCH" ]; then
+            origin_parent=""
+            break
         fi
-
-        mb=$(git merge-base "$target" "$p" 2>/dev/null) || continue
-        [ -z "$mb" ] && continue
-
-        # Require shared history beyond what target shares with main:
-        # mb must be strictly later than fork_main (i.e. fork_main is an
-        # ancestor of mb, and mb != fork_main). This rules out cases where
-        # target's merge-base with p is older than its divergence from main —
-        # such a p was not target's parent (target hasn't seen p's commits).
-        if [ -n "$fork_main" ]; then
-            if [ "$mb" = "$fork_main" ]; then
-                continue
-            fi
-            if ! git merge-base --is-ancestor "$fork_main" "$mb" 2>/dev/null; then
-                continue
-            fi
+        # Both found (local will be main by construction below if still empty).
+        if [ -n "$local_parent" ] && [ -n "$origin_parent" ]; then
+            break
         fi
+    done < <(git rev-list "$MAIN_BRANCH..$target" 2>/dev/null)
 
-        # Topological ranking: a candidate whose merge-base is a (strict)
-        # descendant of the current best's merge-base wins. If the two
-        # merge-bases are identical, break ties alphabetically for stability.
-        if [ -z "$best" ]; then
-            best="$p"
-            best_mb="$mb"
-        elif [ "$mb" = "$best_mb" ]; then
-            if [[ "$p" < "$best" ]]; then
-                best="$p"
-            fi
-        elif git merge-base --is-ancestor "$best_mb" "$mb" 2>/dev/null; then
-            best="$p"
-            best_mb="$mb"
-        fi
-    done
-
-    echo "$best"
+    [ -z "$local_parent" ] && local_parent="$MAIN_BRANCH"
+    printf '%s|%s' "$local_parent" "$origin_parent"
 }
 
 # Maps stored as newline-separated "key|value" strings (bash 3.2 compatible).
+# Lookups and appends are pure-bash to avoid the per-call fork overhead that
+# an awk or printf-subshell pipeline would add.
 LOCAL_PARENT_MAP=""
 ORIGIN_NOTE_MAP=""
 CHILDREN_MAP=""
 
+# Pure-bash map_get: prints first value for key, empty on miss.
 map_get() {
-    # map_get <map-var-value> <key> -> first matching value, or empty
     local map="$1"
     local key="$2"
+    local line
     [ -z "$map" ] && return 0
-    printf '%s\n' "$map" | awk -F'|' -v k="$key" '$1 == k { print substr($0, length(k) + 2); exit }'
+    while IFS= read -r line; do
+        if [ "${line%%|*}" = "$key" ]; then
+            printf '%s' "${line#*|}"
+            return 0
+        fi
+    done <<< "$map"
 }
 
+# Pure-bash map_get_all: prints all values for key, newline-separated.
 map_get_all() {
-    # map_get_all <map-var-value> <key> -> all matching values, newline-separated
     local map="$1"
     local key="$2"
+    local line
     [ -z "$map" ] && return 0
-    printf '%s\n' "$map" | awk -F'|' -v k="$key" '$1 == k { print substr($0, length(k) + 2) }'
+    while IFS= read -r line; do
+        if [ "${line%%|*}" = "$key" ]; then
+            printf '%s\n' "${line#*|}"
+        fi
+    done <<< "$map"
 }
 
-map_append() {
-    # map_append <map-var-value> <key> <value> -> prints new map value
-    local map="$1"
-    local key="$2"
-    local val="$3"
-    if [ -z "$map" ]; then
-        printf '%s|%s' "$key" "$val"
-    else
-        printf '%s\n%s|%s' "$map" "$key" "$val"
-    fi
-}
+total=${#LOCAL_BRANCHES[@]}
+idx=0
+progress_enabled=false
+[ -t 2 ] && [ "$total" -gt 20 ] && progress_enabled=true
 
 for b in "${LOCAL_BRANCHES[@]}"; do
+    idx=$((idx + 1))
     [ "$b" = "$MAIN_BRANCH" ] && continue
 
-    lp=$(find_parent_among "$b" "" "${LOCAL_BRANCHES[@]}")
-    [ -z "$lp" ] && lp="$MAIN_BRANCH"
-    LOCAL_PARENT_MAP=$(map_append "$LOCAL_PARENT_MAP" "$b" "$lp")
+    if [ "$progress_enabled" = true ]; then
+        printf '\r\033[2Kanalysing %d/%d: %s' "$idx" "$total" "$b" >&2
+    fi
 
-    if [ ${#ORIGIN_BRANCHES[@]} -gt 0 ]; then
-        op=$(find_parent_among "$b" "origin/" "${ORIGIN_BRANCHES[@]}")
-        if [ -n "$op" ]; then
-            op_name="${op#origin/}"
-            if [ "$op_name" != "$MAIN_BRANCH" ] && [ "$op_name" != "$lp" ]; then
-                ORIGIN_NOTE_MAP=$(map_append "$ORIGIN_NOTE_MAP" "$b" "$op_name")
-            fi
+    target_sha=$(map_get "$LOCAL_SHA_MAP" "$b")
+    [ -z "$target_sha" ] && continue
+
+    parents=$(find_parents "$b" "$target_sha")
+    lp="${parents%%|*}"
+    op_name="${parents#*|}"
+
+    if [ -z "$LOCAL_PARENT_MAP" ]; then
+        LOCAL_PARENT_MAP="${b}|${lp}"
+    else
+        LOCAL_PARENT_MAP="${LOCAL_PARENT_MAP}"$'\n'"${b}|${lp}"
+    fi
+
+    # find_parents only returns a non-empty origin result when local = main
+    # and origin found a non-main parent — exactly the annotation condition.
+    if [ -n "$op_name" ]; then
+        if [ -z "$ORIGIN_NOTE_MAP" ]; then
+            ORIGIN_NOTE_MAP="${b}|${op_name}"
+        else
+            ORIGIN_NOTE_MAP="${ORIGIN_NOTE_MAP}"$'\n'"${b}|${op_name}"
         fi
     fi
 done
+
+if [ "$progress_enabled" = true ]; then
+    printf '\r\033[2K' >&2
+fi
 
 # ====================================
 # BUILD CHILDREN MAP
@@ -271,7 +371,11 @@ done
 for b in "${LOCAL_BRANCHES[@]}"; do
     [ "$b" = "$MAIN_BRANCH" ] && continue
     parent=$(map_get "$LOCAL_PARENT_MAP" "$b")
-    CHILDREN_MAP=$(map_append "$CHILDREN_MAP" "$parent" "$b")
+    if [ -z "$CHILDREN_MAP" ]; then
+        CHILDREN_MAP="${parent}|${b}"
+    else
+        CHILDREN_MAP="${CHILDREN_MAP}"$'\n'"${parent}|${b}"
+    fi
 done
 
 # ====================================
@@ -283,8 +387,10 @@ status_marker() {
     local parent="$2"
     local ab behind ahead
     ab=$(git rev-list --left-right --count "$parent...$branch" 2>/dev/null) || return 0
-    behind=$(echo "$ab" | awk '{print $1}')
-    ahead=$(echo "$ab" | awk '{print $2}')
+    # Output is "<behind>\t<ahead>". Split with bash parameter expansion
+    # instead of piping to awk twice.
+    behind="${ab%%[[:space:]]*}"
+    ahead="${ab##*[[:space:]]}"
     [ -z "$behind" ] && behind=0
     [ -z "$ahead" ] && ahead=0
     if [ "$behind" = 0 ] && [ "$ahead" = 0 ]; then
